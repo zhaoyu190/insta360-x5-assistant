@@ -1,0 +1,25 @@
+影石助手 / Insta360 X5 Assistant
+Project source is licensed under GNU GPL version 3 or, at your option, any later version.
+See LICENSE. Third-party components retain their own licenses.
+
+Protocol references and acknowledgments:
+- Insta360 OSC: https://github.com/Insta360Develop/Insta360_OSC
+- WhiteBox Insta360 community protocol documentation: https://insta360.whitebox.aero/
+- WhiteBox implementation: https://gitlab.com/whitebox-aero/insta360
+- Community research by avilabss, Niccolo Rigacci, and WhiteBox informed the
+  protocol implementation in backend/live_camera.py.
+
+Runtime and build dependencies:
+- Python: https://www.python.org/ (PSF license and bundled component notices)
+- PyAV: https://github.com/PyAV-Org/PyAV (BSD-3-Clause)
+- Pillow: https://github.com/python-pillow/Pillow (MIT-CMU)
+- PyInstaller: https://github.com/pyinstaller/pyinstaller (GPL with bootloader exception)
+- FFmpeg libraries supplied by the installed PyAV distribution: https://ffmpeg.org/legal.html
+
+The build copies installed package license files when available. Binary distributors
+must review the actual FFmpeg build configuration and all bundled dependency terms,
+and provide any required corresponding source and notices. A local ad-hoc signature
+is not Apple notarization. This repository publishes source, not a signed binary release.
+
+Insta360 and other product names are trademarks of their respective owners.
+This is an independent, unofficial project.

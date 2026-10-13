@@ -1,0 +1,12 @@
+.venv/
+.build/
+dist/
+__pycache__/
+*.py[cod]
+.DS_Store
+*.app/
+*.zip
+*.jsonl
+.env
+.env.*
+cache/

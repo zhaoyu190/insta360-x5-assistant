@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDisplayName</key>
+	<string>影石助手</string>
+	<key>CFBundleExecutable</key>
+	<string>YingShiAssistant</string>
+	<key>CFBundleIconFile</key>
+	<string>Assistant</string>
+	<key>CFBundleIdentifier</key>
+	<string>local.yingshi.assistant</string>
+	<key>CFBundleName</key>
+	<string>影石助手</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.4.1</string>
+	<key>CFBundleVersion</key>
+	<string>5</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>本地开发工具 · 非影石官方应用</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>影石助手需要访问本地网络，以连接 X5、读取素材、预览实时画面并控制录像。</string>
+</dict>
+</plist>
