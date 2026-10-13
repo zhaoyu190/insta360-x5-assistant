@@ -5,7 +5,7 @@ from pathlib import Path
 from PIL import Image
 import av
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'backend'))
-from live_camera import LiveCamera, PreviewDecoder, fields
+from live_camera import LiveCamera, PreviewDecoder, fields, varint
 
 
 def fixture():
@@ -21,7 +21,8 @@ def fixture():
 
 class CameraStub:
  def __init__(self):
-  self.codes=[];self.http_commands=[];self.state=0;self.reject=False;self.drop_start=False
+  self.heartbeats=0
+  self.codes=[];self.http_commands=[];self.state=0;self.reject=False;self.drop_start=False;self.sensor=3;self.mode=0;self.ignore_mode=False
   self.listener=socket.socket();self.listener.bind(('127.0.0.1',0));self.listener.listen()
   self.port=self.listener.getsockname()[1];self.video=fixture()
   threading.Thread(target=self.serve,daemon=True).start()
@@ -49,10 +50,18 @@ class CameraStub:
      size=int.from_bytes(buffer[:4],'little')
      if len(buffer)<size:break
      packet=buffer[4:size];buffer=buffer[size:]
+     if packet==b'\x05\x00\x00':self.heartbeats+=1
      if packet[:3]!=b'\x04\x00\x00':continue
      code=int.from_bytes(packet[3:5],'little');self.codes.append(code)
      status=500 if self.reject else 200
      payload=b'\x12\x04busy' if self.reject else (b'\x0a\x02\x08'+bytes([self.state]) if code==15 else b'')
+     if not self.reject:
+      if code==65:self.sensor=fields(packet[12:])[1]
+      if code==7 and not self.ignore_mode:self.mode=fields(fields(packet[12:])[2])[41]
+      if code==66:payload=b'\x08'+varint(self.sensor)
+      if code==8:
+       value=varint(40<<3)+varint(100)+varint(41<<3)+varint(self.mode)
+       payload=b'\x12'+varint(len(value))+value
      response=b'\x04\x00\x00'+struct.pack('<H',status)+packet[5:12]+payload
      self.send(response)
      if code==1 and not self.reject:
@@ -85,7 +94,7 @@ class Tests(unittest.TestCase):
   self.camera.start_recording();self.assertEqual(self.camera.recording,'recording')
   self.camera.stop_preview();self.assertEqual(self.stub.state,1)
   self.camera.stop_recording();self.assertEqual(self.camera.recording,'idle')
-  self.assertEqual(self.stub.http_commands,['camera.setOptions','camera.startCapture','camera.stopCapture'])
+  self.assertEqual(self.stub.http_commands,['camera.startCapture','camera.stopCapture'])
  def test_reject_and_existing_capture(self):
   self.stub.state=1
   with self.assertRaises(RuntimeError):self.camera.start_recording()
@@ -99,6 +108,57 @@ class Tests(unittest.TestCase):
   with self.assertRaises(Exception):self.camera.start_recording()
   self.assertEqual(self.stub.http_commands.count('camera.startCapture'),1)
   self.assertEqual(self.camera.recording,'unknown')
+ def test_mode_readback_and_record_preserves_submode(self):
+  self.camera.set_mode('instaframe')
+  self.assertEqual((self.stub.sensor,self.stub.mode),(3,15))
+  self.camera.start_recording()
+  self.assertEqual(self.stub.mode,15)
+  self.assertNotIn('camera.setOptions',self.stub.http_commands)
+  with self.assertRaises(RuntimeError):self.camera.set_mode('front')
+  self.assertEqual(self.stub.sensor,3)
+ def test_unapplied_mode_is_not_reported_as_success(self):
+  self.stub.ignore_mode=True
+  with self.assertRaisesRegex(RuntimeError,'未采用'):self.camera.set_mode('instaframe')
+  self.assertEqual(self.camera.video_mode,0)
+  states=[kw for event,kw in self.events if event=='camera_mode']
+  self.assertEqual(states[-1]['mode'],'panorama')
+  self.assertFalse(any(event=='control_message' for event,kw in self.events))
+ def test_mode_change_restarts_existing_preview(self):
+  self.camera.start_preview()
+  self.camera.set_mode('rear')
+  self.assertEqual(self.camera.sensor,2)
+  self.assertTrue(self.camera.preview)
+  self.assertEqual(self.stub.codes.count(1),2)
+  self.assertIn(2,self.stub.codes)
+ def test_invalid_mode_never_connects(self):
+  with self.assertRaises(ValueError):self.camera.set_mode('erase')
+  self.assertEqual(self.stub.codes,[])
+ def test_idle_session_keeps_heartbeat_after_preview_stops(self):
+  self.camera.connect_session();self.camera.start_preview();self.camera.stop_preview()
+  before=self.stub.heartbeats
+  deadline=time.monotonic()+3
+  while self.stub.heartbeats==before and time.monotonic()<deadline:time.sleep(.02)
+  self.assertGreater(self.stub.heartbeats,before)
+  self.assertFalse(self.stub.http_commands)
+  self.assertTrue(self.camera.session_active)
+  self.camera.close();self.camera.last_retry=0;self.camera.tick()
+  self.assertIsNone(self.camera.socket)
+ def test_reconnect_only_reads_state_never_restarts_recording(self):
+  self.camera.connect_session()
+  self.stub.client.shutdown(socket.SHUT_RDWR)
+  self.assertTrue(self.camera.halt.wait(2))
+  replacement=CameraStub()
+  try:
+   replacement.state=1
+   self.camera.tcp_port=replacement.port
+   self.camera.last_retry=0;self.camera.tick()
+   self.assertEqual(self.camera.recording,'recording')
+   self.assertFalse(self.camera.preview)
+   self.assertFalse(replacement.http_commands)
+   self.assertNotIn(1,replacement.codes)
+   self.assertNotIn(7,replacement.codes)
+   self.assertTrue(any(e=='connection_health' and v['state']=='online' for e,v in self.events))
+  finally:self.camera.close();replacement.close()
  def test_unknown_protobuf(self):
   with self.assertRaises(ValueError):fields(b'\x0a\xff')
   with self.assertRaises(ValueError):fields(b'\x0a\x03a')

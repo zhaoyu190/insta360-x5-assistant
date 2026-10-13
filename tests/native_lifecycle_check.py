@@ -20,7 +20,9 @@ class FakeCamera:
 b.Camera=FakeCamera
 class FakeLive:
  def __init__(self,*args):pass
+ def connect_session(self):pass
  def sync_status(self):pass
+ def sync_modes(self):pass
  def tick(self):pass
  def stop_preview(self):pass
  def close(self):pass

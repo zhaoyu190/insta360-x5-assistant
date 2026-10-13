@@ -36,7 +36,8 @@ def main():
     shutil.copytree(BUILD / 'backend-dist' / 'CameraBridge', resources / 'Backend', symlinks=True)
     run('xcrun', 'swiftc', '-target', 'arm64-apple-macosx14.0', '-swift-version', '5',
         '-parse-as-library', '-O', '-framework', 'SwiftUI', '-framework', 'AppKit',
-        ROOT / 'app' / 'App.swift', '-o', executable_dir / 'YingShiAssistant')
+        '-framework', 'MetalKit', *sorted((ROOT / 'app').glob('*.swift')),
+        '-o', executable_dir / 'YingShiAssistant')
     with (ROOT / 'app' / 'Info.plist').open('rb') as stream:
         info = plistlib.load(stream)
     info['CFBundleShortVersionString'] = (ROOT / 'VERSION').read_text().strip()

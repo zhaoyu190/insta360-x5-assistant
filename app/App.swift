@@ -17,6 +17,11 @@ final class CameraModel: ObservableObject {
     @Published var controlMessage = "正在读取相机拍摄状态…"
     @Published var controlBusy = false
     @Published var previewBusy = false
+    @Published var cameraMode = ""
+    @Published var cameraModeLabel = "正在读取拍摄模式…"
+    @Published var cameraModes: [[String: String]] = []
+    @Published var sensor = 0
+    @Published var connectionHealth = "正在建立控制连接…"
     var process: Process?
     var input: Pipe?
     var output: Pipe?
@@ -42,6 +47,9 @@ final class CameraModel: ObservableObject {
         error = false; phase = "connecting"; message = "正在连接 X5…"
         fileCount = 0; dates = ""; received = 0; cached = 0; speed = 0
         previewImage = nil; previewState = "off"; recordState = "unknown"
+        cameraMode = ""; cameraModes = []; sensor = 0
+        connectionHealth = "正在建立控制连接…"
+        cameraModeLabel = "正在读取拍摄模式…"
         controlBusy = false; previewBusy = false
         controlMessage = "正在读取相机拍摄状态…"
         let task = Process(); let stdinPipe = Pipe(); let stdoutPipe = Pipe(); let stderrPipe = Pipe()
@@ -115,6 +123,13 @@ final class CameraModel: ObservableObject {
         case "record_state":
             recordState = obj["state"] as? String ?? "unknown"
             if controlMessage == "正在读取相机拍摄状态…" { controlMessage = "录像保存在相机存储卡；预览只用于取景。" }
+        case "connection_health":
+            connectionHealth = obj["message"] as? String ?? "控制连接未确认"
+        case "camera_mode":
+            cameraMode = obj["mode"] as? String ?? ""
+            cameraModeLabel = obj["label"] as? String ?? "模式未确认"
+            cameraModes = obj["modes"] as? [[String: String]] ?? []
+            sensor = obj["sensor"] as? Int ?? 0
         case "control_message", "control_error":
             controlMessage = obj["message"] as? String ?? ""
         case "read_issue":
@@ -157,7 +172,7 @@ final class CameraModel: ObservableObject {
         phase = "disconnecting"; message = "正在安全断开相机…"; error = false
         try? input.fileHandleForWriting.write(contentsOf: Data("{\"command\":\"disconnect\"}\n".utf8))
     }
-    func control(_ command: String) {
+    func control(_ command: String, mode: String? = nil) {
         guard phase == "connected", let input = input else { return }
         if command.hasPrefix("preview_") {
             previewBusy = true
@@ -166,9 +181,14 @@ final class CameraModel: ObservableObject {
             previewMessage = command == "preview_start" ? "正在等待相机实时画面…" : "正在关闭预览…"
         } else {
             controlBusy = true
-            controlMessage = command == "record_start" ? "正在请求开始录像…" : command == "record_stop" ? "正在停止并保存录像…" : "正在读取相机拍摄状态…"
+            controlMessage = command == "mode_set" ? "正在切换并核对相机模式…" : command == "record_start" ? "正在请求开始录像…" : command == "record_stop" ? "正在停止并保存录像…" : "正在读取相机拍摄状态…"
         }
-        do { try input.fileHandleForWriting.write(contentsOf: Data("{\"command\":\"\(command)\"}\n".utf8)) }
+        do {
+            var payload = ["command": command]
+            if let mode = mode { payload["mode"] = mode }
+            var data = try JSONSerialization.data(withJSONObject: payload); data.append(10)
+            try input.fileHandleForWriting.write(contentsOf: data)
+        }
         catch { controlBusy = false; previewBusy = false; controlMessage = "无法发送操作，请重新连接相机。" }
     }
     func openFiles() {
@@ -217,10 +237,15 @@ struct SetupStep: View {
 
 struct ContentView: View {
     @ObservedObject var model: CameraModel
+    @State private var rawPreview = false
+    @State private var resetID = 0
+    @State private var roll = 1
+    @State private var selectedMode = "panorama"
     let accent = Color(red: 0.94, green: 0.39, blue: 0.14)
     var active: Bool { model.phase == "connected" }
     var working: Bool { model.phase == "connecting" || model.phase == "disconnecting" }
     var body: some View {
+        ScrollView {
         VStack(alignment: .leading, spacing: 22) {
             HStack(spacing: 15) {
                 ZStack {
@@ -230,7 +255,7 @@ struct ContentView: View {
                 }
                 VStack(alignment: .leading, spacing: 5) {
                     Text("影石助手").font(.system(size: 26, weight: .bold))
-                    Text("无线访问素材 · 实时取景 · 遥控录像").font(.system(size: 13)).foregroundStyle(.secondary)
+                    Text("无线素材 · 全景取景 · 拍摄控制").font(.system(size: 13)).foregroundStyle(.secondary)
                 }
                 Spacer()
                 HStack(spacing: 6) {
@@ -281,20 +306,22 @@ struct ContentView: View {
             Spacer(minLength: 0)
             HStack(alignment: .bottom) {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("连接相机热点期间，Mac 可能暂时无法上网。")
-                    Text("保持相机开机；使用结束后先断开相机，再切换 Wi-Fi。")
+                    Text("Wi-Fi 连接相机时，可通过手机 USB 网络共享同时上网。")
+                    Text("保持相机开机；关闭 Studio 中的素材后，再安全断开。")
                 }.font(.system(size: 11)).foregroundStyle(.secondary)
                 Spacer()
                 Button("查看日志", action: model.openLogs).buttonStyle(.link).font(.system(size: 11))
             }
-        }.padding(30).frame(width: 670, height: 740)
+        }.padding(30)
+        }.frame(minWidth: 760, minHeight: 760)
             .background(Color(nsColor: .windowBackgroundColor))
+            .onChange(of: model.cameraMode) { _, mode in if !mode.isEmpty { selectedMode = mode } }
     }
     var liveView: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Text("实时画面").font(.system(size: 15, weight: .semibold))
-                Text("基础预览").font(.system(size: 10)).foregroundStyle(.secondary)
+                Text(rawPreview ? "原始画面" : model.sensor == 3 ? "360° 拖动取景" : "单镜头取景").font(.system(size: 10)).foregroundStyle(.secondary)
                 Spacer()
                 Label(model.recordState == "recording" ? "录像中" : model.recordState == "idle" ? "待机" : model.recordState == "busy" ? "相机忙碌" : "拍摄状态未确认",
                       systemImage: model.recordState == "recording" ? "record.circle.fill" : "circle")
@@ -304,7 +331,8 @@ struct ContentView: View {
             ZStack {
                 RoundedRectangle(cornerRadius: 12).fill(Color.black.opacity(0.94))
                 if let image = model.previewImage {
-                    Image(nsImage: image).resizable().scaledToFit().padding(3)
+                    PanoramaView(image: image, raw: rawPreview, singleLens: model.sensor == 1 || model.sensor == 2,
+                                 resetID: resetID, roll: model.sensor == 2 ? -roll : roll).clipShape(RoundedRectangle(cornerRadius:12))
                 } else {
                     VStack(spacing: 12) {
                         if model.previewState == "starting" { ProgressView().colorScheme(.dark) }
@@ -313,7 +341,28 @@ struct ContentView: View {
                             .multilineTextAlignment(.center).frame(maxWidth: 410)
                     }.padding(20)
                 }
-            }.frame(height: 235).clipped().accessibilityLabel("相机实时预览")
+            }.frame(height: 310).clipped().accessibilityLabel("相机实时预览")
+            HStack(spacing: 12) {
+                Toggle("原始画面", isOn: $rawPreview).toggleStyle(.checkbox)
+                Button("视角回正") { resetID += 1 }
+                Button("旋转 90°") { roll = (roll + 1) % 4 }
+                Spacer()
+                Text("拖动转向 · 滚动 / 捏合缩放 · 双击回正").foregroundStyle(.secondary)
+            }.font(.system(size:11)).disabled(model.previewImage == nil)
+            Text("实时取景使用基础鱼眼投影，接缝处可能重影；不会改变相机保存的原片或云台跟拍目标。")
+                .font(.system(size:10)).foregroundStyle(.secondary)
+            HStack(spacing: 12) {
+                Picker("拍摄模式", selection: $selectedMode) {
+                    ForEach(model.cameraModes.indices, id: \.self) { index in
+                        Text(model.cameraModes[index]["label"] ?? "").tag(model.cameraModes[index]["id"] ?? "")
+                    }
+                }.frame(maxWidth: 330)
+                Button("应用模式") { model.control("mode_set", mode: selectedMode) }
+                    .disabled(model.cameraModes.isEmpty)
+                Spacer()
+            }.disabled(model.controlBusy || model.previewBusy || model.recordState != "idle")
+            Text("当前：\(model.cameraModeLabel)").font(.system(size:11)).foregroundStyle(.secondary)
+            Text(model.connectionHealth).font(.system(size:11)).foregroundStyle(.secondary)
             HStack(spacing: 10) {
                 Button { model.control(model.previewState == "on" || model.previewState == "starting" ? "preview_stop" : "preview_start") } label: {
                     Label(model.previewState == "on" || model.previewState == "starting" ? "关闭预览" : "开启预览", systemImage: "video")
@@ -349,7 +398,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         submenu.addItem(.separator())
         submenu.addItem(withTitle: "退出影石助手", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = submenu; menu.addItem(appItem); NSApp.mainMenu = menu
-        window = NSWindow(contentRect: NSRect(x:0,y:0,width:670,height:740), styleMask:[.titled,.closable,.miniaturizable], backing:.buffered, defer:false)
+        window = NSWindow(contentRect: NSRect(x:0,y:0,width:850,height:850), styleMask:[.titled,.closable,.miniaturizable,.resizable], backing:.buffered, defer:false)
+        window.minSize = NSSize(width:760,height:760)
         window.title = "影石助手"; window.titlebarAppearsTransparent = true
         window.contentView = NSHostingView(rootView: ContentView(model: model))
         window.delegate = self; window.isReleasedWhenClosed = false

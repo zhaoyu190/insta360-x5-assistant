@@ -23,12 +23,13 @@ def emit(event,**values):
 def reader():
     for line in sys.stdin:
         try:
-            command=json.loads(line).get('command')
-            if command in ('disconnect','preview_start','preview_stop','record_start','record_stop','status'):
+            payload=json.loads(line)
+            command=payload.get('command')
+            if command in ('disconnect','preview_start','preview_stop','record_start','record_stop','status','mode_set'):
                 if command=='disconnect':stop.set()
-                commands.put(command)
+                commands.put((command,payload.get('mode')))
         except (ValueError,AttributeError):pass
-    stop.set();commands.put('disconnect')
+    stop.set();commands.put(('disconnect',None))
 def system(command):
     result=subprocess.run(command,capture_output=True,text=True,timeout=30)
     if result.returncode and any(s in result.stderr.lower() for s in ('operation not permitted','permission denied','must be root')):
@@ -64,6 +65,11 @@ def run(base):
     threading.Thread(target=reader,daemon=True).start()
     try:
         emit('progress',message='正在连接 X5…',log=str(log.path))
+        live=LiveCamera(emit,report)
+        try:live.connect_session()
+        except Exception as exc:
+            report('live_init_error',error=str(exc))
+            emit('connection_health',state='offline',message='控制保活尚未建立，连接后会重试。')
         camera=Camera(report,cache_dir=base/'缓存')
         with contextlib.redirect_stdout(sys.stderr):
             entries=camera.catalog()
@@ -84,11 +90,12 @@ def run(base):
         proxies=len(summary.get('missing_proxies',[]))
         if missed or proxies:
             emit('read_issue',message=f'素材盘已连接，但有 {missed} 个文件读取失败、{proxies} 段原片未找到配套 LRV，预览或导出可能受影响。请重连后再导入。')
-        live=LiveCamera(emit,report)
         try:live.sync_status()
         except Exception as exc:
             report('live_init_error',error=str(exc))
             emit('control_error',message='暂时无法读取拍摄状态，可点击“同步状态”重试。')
+        try:live.sync_modes()
+        except Exception as exc:report('mode_init_error',error=str(exc))
         while True:
             if stop.is_set():
                 result=system(['/sbin/umount',str(mount)])
@@ -96,14 +103,16 @@ def run(base):
                 emit('busy',message='素材仍在使用。请关闭 Studio 中的素材和预览窗口，再点“断开相机”。')
                 stop.clear()
                 while not commands.empty():commands.get_nowait()
-            try:command=commands.get(timeout=.5)
-            except queue.Empty:command=None
+            try:command,mode=commands.get(timeout=.5)
+            except queue.Empty:command=None;mode=None
             if command=='disconnect':stop.set()
             elif command:
                 try:
-                    {'preview_start':live.start_preview,'preview_stop':live.stop_preview,
-                     'record_start':live.start_recording,'record_stop':live.stop_recording,
-                     'status':live.sync_status}[command]()
+                    if command=='mode_set':live.set_mode(mode)
+                    else:
+                        {'preview_start':live.start_preview,'preview_stop':live.stop_preview,
+                         'record_start':live.start_recording,'record_stop':live.stop_recording,
+                         'status':live.refresh_status}[command]()
                 except Exception as exc:
                     report('control_error',command=command,error=str(exc))
                     if command.startswith('preview_'):
@@ -124,12 +133,12 @@ def run(base):
         if live:
             try:live.stop_preview()
             except Exception:pass
-            live.close()
         # Never stop serving an active mount; keep UI alive if Studio still holds files.
         while os.path.ismount(mount):
             emit('busy',message='素材盘仍在使用，请关闭素材后再次断开。')
             commands.get()
             system(['/sbin/umount',str(mount)])
+        if live:live.close()
         if server:server.shutdown();server.server_close()
         if camera:camera.close()
         emit('disconnected')

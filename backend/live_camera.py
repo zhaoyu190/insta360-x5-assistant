@@ -13,6 +13,23 @@ import threading
 import time
 import av
 
+MODES = {
+    'panorama': ('360° 全景录像', 3, 0),
+    'front': ('单镜头 · 前镜头', 1, 0),
+    'rear': ('单镜头 · 后镜头', 2, 0),
+    # X5 firmware A3_1.13.21.623_build1, observed after selecting InstaFrame
+    # on the camera. Do not infer this value from older SDK enum tables.
+    'instaframe': ('云台 / 动态跟拍', 3, 15),
+}
+
+def varint(value):
+    if not isinstance(value, int) or not 0 <= value <= 0xffffffff:
+        raise ValueError('无效协议参数')
+    out = bytearray()
+    while value > 127:
+        out.append((value & 127) | 128); value >>= 7
+    return bytes(out) + bytes([value])
+
 
 def fields(data):
     """Read bounded protobuf wire fields without requiring generated schemas."""
@@ -49,12 +66,13 @@ class PreviewDecoder:
         for packet in self.codec.parse(data):
             for frame in self.codec.decode(packet):
                 now = time.monotonic()
-                if now-self.last < 0.10: continue
+                if now-self.last < 1/15: continue
                 self.last = now; self.frames += 1
                 image = frame.to_image()
-                image.thumbnail((960, 540))
-                output = io.BytesIO(); image.save(output, format='JPEG', quality=75)
-                self.emit('preview_frame', jpeg=base64.b64encode(output.getvalue()).decode('ascii'))
+                image.thumbnail((1440, 1440))
+                output = io.BytesIO(); image.save(output, format='JPEG', quality=82)
+                self.emit('preview_frame', jpeg=base64.b64encode(output.getvalue()).decode('ascii'),
+                          width=image.width, height=image.height)
 
 
 class LiveCamera:
@@ -76,13 +94,27 @@ class LiveCamera:
         self.preview_failed = False
         self.threads = []
         self.stream_types = set()
+        self.sensor = None
+        self.video_mode = None
+        self.mode_dirty = True
+        self.session_active = False
+        self.last_retry = 0
+        self.last_received = time.monotonic()
+
+    def connect_session(self):
+        """Keep a phone-style control session for the entire material mount."""
+        self.session_active = True
+        self.last_retry = time.monotonic()
+        self.sync_status()
+        self.emit("connection_health", state="online", message="控制连接在线 · 每 2 秒保活")
 
     def open(self):
         if self.socket and not self.halt.is_set(): return
-        self.close()
+        self._close_transport()
         self.halt = threading.Event()
         self.socket = socket.create_connection((self.host, self.tcp_port), timeout=4)
         self.socket.settimeout(1)
+        self.last_received = time.monotonic()
         self.send(b'\x06\x00\x00syNceNdinS')
         self.send(b'\x05\x00\x00')
         self.threads = [threading.Thread(target=f, daemon=True) for f in (self.receive, self.keepalive, self.decode)]
@@ -121,6 +153,7 @@ class LiveCamera:
                 try: chunk = self.socket.recv(65536)
                 except socket.timeout: continue
                 if not chunk: raise ConnectionError('相机控制连接已断开')
+                self.last_received = time.monotonic()
                 buffer.extend(chunk)
                 while len(buffer) >= 4:
                     size = struct.unpack_from('<I', buffer)[0]
@@ -131,6 +164,8 @@ class LiveCamera:
         except Exception as exc:
             if not self.halt.is_set():
                 self.log('live_connection_error', error=str(exc))
+                self.emit('connection_health', state='offline', message='控制连接已断开，正在尝试恢复…')
+                self.emit('camera_mode', mode='', sensor=0, video_mode=-1, label='拍摄模式未确认', modes=[])
                 self.emit('control_error', message=str(exc)+'。录像可能仍在继续，请检查相机。')
                 self.recording = 'unknown'; self.emit('record_state', state='unknown')
                 self.preview = False; self.emit('preview_state', state='error', message='实时连接已中断，可重新开启预览。')
@@ -149,7 +184,7 @@ class LiveCamera:
             if packet[3] == 0x20 and self.preview:
                 if len(packet) > 1024*1024:
                     self.preview_failed = True; return
-                try: self.video.put_nowait(packet[12:])
+                try: self.video.put_nowait((self.decoder, packet[12:]))
                 except queue.Full:
                     # Never grow a delayed preview; fail visibly and allow a fresh keyframe stream.
                     self.preview_failed = True
@@ -157,6 +192,9 @@ class LiveCamera:
         if packet[:3] != b'\x04\x00\x00': return
         code = int.from_bytes(packet[3:5], 'little')
         seq = int.from_bytes(packet[6:9], 'little')
+        if code == 8275:  # CAMERA_NOTIFICATION_CAM_SUBMODE_CHANGE
+            self.mode_dirty = True
+            return
         if code == 8208:
             self.status_payload(packet[12:]); return
         with self.pending_lock:
@@ -179,30 +217,89 @@ class LiveCamera:
         if not isinstance(result.get(1), bytes): raise ValueError('相机未返回可识别的录像状态')
         self.status_payload(result[1])
 
+    def sync_modes(self):
+        sensor = fields(self.command(66)).get(1)
+        response = fields(self.command(8, b'\x0a\x02\x28\x29'))
+        values = fields(response.get(2, b''))
+        video = values.get(41)
+        if sensor not in (1, 2, 3) or not isinstance(video, int):
+            self.sensor = self.video_mode = None
+            raise RuntimeError('此固件未返回可识别的拍摄模式')
+        self.sensor, self.video_mode = sensor, video
+        current = next((key for key, (_, s, v) in MODES.items() if (s, v) == (sensor, video)), '')
+        self.mode_dirty = False
+        self.emit('camera_mode', mode=current, sensor=sensor, video_mode=video,
+                  label=MODES[current][0] if current else '相机当前模式（请在相机上调整）',
+                  modes=[{'id':key,'label':value[0]} for key,value in MODES.items()])
+        return sensor, video
+
+    def refresh_status(self):
+        self.sync_status()
+        self.sync_modes()
+
+    def set_mode(self, mode):
+        if mode not in MODES: raise ValueError('不支持的拍摄模式')
+        self.sync_status()
+        if self.recording != 'idle': raise RuntimeError('请先停止拍摄并等待保存完成，再切换模式。')
+        resume = self.preview
+        if resume: self.stop_preview()
+        try:
+            _, sensor, video = MODES[mode]
+            self.command(65, b'\x08' + varint(sensor))
+            # SetOptions.option_types=[VIDEO_SUB_MODE], value.video_sub_mode.
+            value = varint(41 << 3) + varint(video)
+            self.command(7, b'\x0a\x01\x29\x12' + varint(len(value)) + value)
+            actual = self.sync_modes()
+            if actual != (sensor, video):
+                raise RuntimeError('相机未采用所选模式，已显示相机实际状态。请检查固件或相机屏幕。')
+            self.emit('control_message', message='已切换至'+MODES[mode][0]+'。仅切换模式，尚未开始拍摄。')
+        except Exception:
+            # A rejected second command can leave a partial change: read back,
+            # never show the requested mode as if the transaction succeeded.
+            try: self.sync_modes()
+            except Exception:
+                self.sensor = self.video_mode = None
+                self.emit('camera_mode', mode='', sensor=0, video_mode=-1, label='拍摄模式未确认', modes=[])
+            raise
+        finally:
+            if resume:
+                try: self.start_preview()
+                except Exception as exc:
+                    self.emit('preview_state', state='error', message='模式已处理，但预览未恢复：'+str(exc))
+
     def keepalive(self):
         while not self.halt.wait(2):
-            try: self.send(b'\x05\x00\x00')
-            except OSError: return
+            try:
+                if time.monotonic()-self.last_received > 15:
+                    self.socket.shutdown(socket.SHUT_RDWR)
+                    return
+                self.send(b'\x05\x00\x00')
+            except OSError:
+                try: self.socket.shutdown(socket.SHUT_RDWR)
+                except OSError: pass
+                return
 
     def decode(self):
         while not self.halt.is_set():
-            try: data = self.video.get(timeout=.5)
+            try: decoder, data = self.video.get(timeout=.5)
             except queue.Empty: continue
-            decoder = self.decoder
-            if not self.preview or decoder is None: continue
+            if not self.preview or decoder is None or decoder is not self.decoder: continue
             try:
                 before = decoder.frames
                 decoder.feed(data)
-                if decoder.frames > before: self.last_frame = time.monotonic()
+                if decoder is self.decoder and decoder.frames > before: self.last_frame = time.monotonic()
             except Exception as exc:
                 self.log('preview_decode_error', error=str(exc))
-                self.preview_failed = True
+                if decoder is self.decoder: self.preview_failed = True
 
     def start_preview(self):
         self.open()
         if self.preview: return
         while not self.video.empty(): self.video.get_nowait()
-        self.decoder = PreviewDecoder(self.emit)
+        def emit_current(event, **values):
+            if self.preview and self.decoder is decoder: self.emit(event, **values)
+        decoder = PreviewDecoder(emit_current)
+        self.decoder = decoder
         self.preview_failed = False; self.last_frame = time.monotonic()
         self.preview = True
         self.emit('preview_state', state='starting', message='正在等待相机实时画面…')
@@ -213,7 +310,7 @@ class LiveCamera:
             self.log('preview_started')
         except Exception:
             self.preview = False
-            self.close()
+            self._close_transport()
             raise
 
     def stop_preview(self):
@@ -247,7 +344,10 @@ class LiveCamera:
     def start_recording(self):
         self.sync_status()
         if self.recording != 'idle': raise RuntimeError('相机正在拍摄或处理素材，请先停止或等待完成。')
-        self.osc('camera.setOptions', {'options':{'captureMode':'video'}})
+        self.sync_modes()
+        if self.video_mode == 100: raise RuntimeError('当前是拍照模式，请先选择一种录像模式。')
+        # Preserve the selected lens and submode; setting captureMode=video here
+        # can silently reset InstaFrame or another mode to normal video.
         try:
             self.osc('camera.startCapture')
         except Exception:
@@ -264,6 +364,16 @@ class LiveCamera:
         return result
 
     def tick(self):
+        if self.session_active and (not self.socket or self.halt.is_set()):
+            if time.monotonic()-self.last_retry < 8: return
+            self.last_retry = time.monotonic()
+            try:
+                self.connect_session()
+                self.sync_modes()
+            except Exception as exc:
+                self.log('control_reconnect_error', error=str(exc))
+                self.emit('connection_health', state='offline', message='等待 X5 Wi-Fi 恢复；关机后需先手动开机。')
+            return
         if self.preview and (self.preview_failed or time.monotonic()-self.last_frame>10):
             try: self.stop_preview()
             except Exception: pass
@@ -274,8 +384,17 @@ class LiveCamera:
                 self.last_status=time.monotonic()
                 self.recording='unknown'; self.emit('record_state',state='unknown')
                 self.log('capture_status_error',error=str(exc))
+        if self.mode_dirty and self.socket and not self.halt.is_set():
+            try: self.sync_modes()
+            except Exception as exc:
+                self.mode_dirty = False
+                self.log('mode_status_error', error=str(exc))
 
     def close(self):
+        self.session_active = False
+        self._close_transport()
+
+    def _close_transport(self):
         self.halt.set(); self.preview=False
         if self.socket:
             try: self.socket.shutdown(socket.SHUT_RDWR)
