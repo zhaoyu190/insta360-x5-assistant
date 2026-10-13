@@ -3,9 +3,7 @@ Protocol reference: https://gitlab.com/whitebox-aero/insta360
 No recording command is retried automatically. Video frames never touch disk.
 """
 import base64
-import http.client
 import io
-import json
 import queue
 import socket
 import struct
@@ -100,6 +98,8 @@ class LiveCamera:
         self.session_active = False
         self.last_retry = 0
         self.last_received = time.monotonic()
+        self.command_timeout = 6
+        self.capture_timeout = 10
 
     def connect_session(self):
         """Keep a phone-style control session for the entire material mount."""
@@ -134,8 +134,16 @@ class LiveCamera:
         try:
             self.send(b'\x04\x00\x00'+struct.pack('<H', code)+b'\x02'+sequence.to_bytes(3,'little')+b'\x80\x00\x00'+body)
             self.log('live_command', code=code, sequence=sequence)
-            try: result = response.get(timeout=6)
-            except queue.Empty: raise TimeoutError('相机控制响应超时，请检查 Wi-Fi 和相机屏幕')
+            try: result = response.get(timeout=self.command_timeout)
+            except queue.Empty:
+                # Preview/heartbeat traffic can remain alive while commands stop
+                # responding. Invalidate this session even if bytes still arrive.
+                self.log('control_timeout', code=code, sequence=sequence)
+                self._close_transport()
+                self.recording = 'unknown'; self.emit('record_state', state='unknown')
+                self.emit('preview_state', state='error', message='控制响应超时，正在恢复连接；可重新开启预览。')
+                self.emit('connection_health', state='offline', message='控制响应超时，正在恢复连接…')
+                raise TimeoutError('相机控制响应超时；将重新建立控制连接，不会重复发送拍摄指令')
             if isinstance(result, Exception): raise result
             status, payload = result
             self.log('live_response', code=code, status=status, payload_bytes=len(payload))
@@ -207,8 +215,12 @@ class LiveCamera:
         status = fields(data)
         value = status.get(1, 0)
         if value == 0: state = 'idle'
-        elif value in (1,2,7,9,12,13,17,18,20,21,22,23,24): state = 'recording'
-        else: state = 'busy'
+        # X5 InstaFrame reports 30 (observed with elapsed capture time and
+        # a saved video), absent from the older public protocol enum.
+        elif value in (1,2,7,9,12,13,17,18,20,21,22,23,24,30): state = 'recording'
+        elif value in (3,4,5,6,8,10,11,14,15,16,19): state = 'busy'
+        else: state = 'unknown'  # Keep Stop available for newer firmware states.
+        self.log('capture_status', value=value, substate=status.get(10, 0), seconds=status.get(2, 0))
         self.recording = state; self.last_status = time.monotonic()
         self.emit('record_state', state=state)
 
@@ -216,6 +228,7 @@ class LiveCamera:
         result = fields(self.command(15))
         if not isinstance(result.get(1), bytes): raise ValueError('相机未返回可识别的录像状态')
         self.status_payload(result[1])
+        self.emit('connection_health', state='online', message='控制连接在线 · 每 2 秒保活')
 
     def sync_modes(self):
         sensor = fields(self.command(66)).get(1)
@@ -320,25 +333,27 @@ class LiveCamera:
         self.decoder = None
         self.emit('preview_state', state='off', message='预览已关闭；不会影响相机录像。')
 
-    def osc(self, name, parameters=None):
-        def request(path, payload):
-            conn = http.client.HTTPConnection(self.host, self.http_port, timeout=8)
-            try:
-                conn.request('POST', path, json.dumps(payload), {'Content-Type':'application/json', 'X-XSRF-Protected':'1'})
-                response = conn.getresponse(); raw = response.read(1024*1024+1)
-                if response.status != 200 or len(raw)>1024*1024: raise RuntimeError('相机控制 HTTP 响应异常')
-                return json.loads(raw)
-            finally: conn.close()
-        payload = {'name':name}
-        if parameters is not None: payload['parameters'] = parameters
-        result = request('/osc/commands/execute', payload)
-        deadline = time.monotonic()+20
-        while result.get('state') == 'inProgress' and result.get('id') and time.monotonic()<deadline:
-            time.sleep(.4)
-            result = request('/osc/commands/status', {'id':result['id']})
-        self.log('capture_command', name=name, response=result)
-        if result.get('state') != 'done':
-            raise RuntimeError(str(result.get('error', '相机尚未确认操作完成，请检查相机屏幕')))
+    def confirm_capture(self, expected):
+        """An ACK only accepts a request. Require actual capture status as proof."""
+        deadline = time.monotonic() + self.capture_timeout
+        while True:
+            self.sync_status()
+            if self.recording == expected: return
+            if time.monotonic() >= deadline:
+                raise RuntimeError('相机未确认'+('开始录像' if expected == 'recording' else '停止录像')+'；已显示实际状态，请检查相机屏幕。')
+            time.sleep(.25)
+
+    def capture_command(self, code, body, expected):
+        try:
+            result = self.command(code, body)
+        except Exception:
+            # Lost ACKs must never cause a second start/stop. Reconcile by
+            # reading only, so an uncertain result does not lock the UI forever.
+            try: self.sync_status()
+            except Exception:
+                self.recording = 'unknown'; self.emit('record_state', state='unknown')
+            raise
+        self.confirm_capture(expected)
         return result
 
     def start_recording(self):
@@ -348,18 +363,13 @@ class LiveCamera:
         if self.video_mode == 100: raise RuntimeError('当前是拍照模式，请先选择一种录像模式。')
         # Preserve the selected lens and submode; setting captureMode=video here
         # can silently reset InstaFrame or another mode to normal video.
-        try:
-            self.osc('camera.startCapture')
-        except Exception:
-            self.recording='unknown'; self.emit('record_state', state='unknown'); raise
-        self.recording='recording'; self.emit('record_state', state='recording')
+        # X5 OSC can report "done" without changing capture state. Use the
+        # same TCP control session as preview, with Capture_MODE_NORMAL=1.
+        self.capture_command(4, b'\x08\x01', 'recording')
         self.emit('control_message', message='已开始录像，视频保存在相机存储卡。')
 
     def stop_recording(self):
-        try: result = self.osc('camera.stopCapture')
-        except Exception:
-            self.recording='unknown'; self.emit('record_state', state='unknown'); raise
-        self.recording='idle'; self.emit('record_state', state='idle')
+        result = self.capture_command(5, b'', 'idle')
         self.emit('control_message', message='录像已停止并保存在相机。重新连接后可在素材盘看到新视频。')
         return result
 

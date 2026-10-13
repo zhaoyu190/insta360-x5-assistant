@@ -21,7 +21,7 @@ def fixture():
 
 class CameraStub:
  def __init__(self):
-  self.heartbeats=0
+  self.heartbeats=0;self.closed=False;self.ignore_capture=False;self.ignore_stop=False;self.stall=False
   self.codes=[];self.http_commands=[];self.state=0;self.reject=False;self.drop_start=False;self.sensor=3;self.mode=0;self.ignore_mode=False
   self.listener=socket.socket();self.listener.bind(('127.0.0.1',0));self.listener.listen()
   self.port=self.listener.getsockname()[1];self.video=fixture()
@@ -40,39 +40,52 @@ class CameraStub:
   self.http=ThreadingHTTPServer(('127.0.0.1',0),Handler)
   threading.Thread(target=self.http.serve_forever,daemon=True).start()
  def serve(self):
-  try:
-   self.client,_=self.listener.accept();buffer=b''
-   while True:
-    part=self.client.recv(65536)
-    if not part:return
-    buffer+=part
-    while len(buffer)>=4:
-     size=int.from_bytes(buffer[:4],'little')
-     if len(buffer)<size:break
-     packet=buffer[4:size];buffer=buffer[size:]
-     if packet==b'\x05\x00\x00':self.heartbeats+=1
-     if packet[:3]!=b'\x04\x00\x00':continue
-     code=int.from_bytes(packet[3:5],'little');self.codes.append(code)
-     status=500 if self.reject else 200
-     payload=b'\x12\x04busy' if self.reject else (b'\x0a\x02\x08'+bytes([self.state]) if code==15 else b'')
-     if not self.reject:
-      if code==65:self.sensor=fields(packet[12:])[1]
-      if code==7 and not self.ignore_mode:self.mode=fields(fields(packet[12:])[2])[41]
-      if code==66:payload=b'\x08'+varint(self.sensor)
-      if code==8:
-       value=varint(40<<3)+varint(100)+varint(41<<3)+varint(self.mode)
-       payload=b'\x12'+varint(len(value))+value
-     response=b'\x04\x00\x00'+struct.pack('<H',status)+packet[5:12]+payload
-     self.send(response)
-     if code==1 and not self.reject:
-      # Tiny TCP fragments exercise both packet and H264 reassembly.
-      for p in range(0,len(self.video),257):
-       self.send(b'\x01\x00\x00\x20'+b'\x00'*8+self.video[p:p+257])
-  except OSError:pass
+  while not self.closed:
+   try:
+    self.client,_=self.listener.accept()
+    try:self.serve_client()
+    finally:self.client.close()
+   except OSError:pass
+ def serve_client(self):
+  buffer=b''
+  while not self.closed:
+   part=self.client.recv(65536)
+   if not part:return
+   buffer+=part
+   while len(buffer)>=4:
+    size=int.from_bytes(buffer[:4],'little')
+    if len(buffer)<size:break
+    packet=buffer[4:size];buffer=buffer[size:]
+    if packet==b'\x05\x00\x00':self.heartbeats+=1
+    if packet[:3]!=b'\x04\x00\x00':continue
+    code=int.from_bytes(packet[3:5],'little');self.codes.append(code)
+    if self.stall:
+     self.send(b'\x01\x00\x00\x40'+b'\x00'*12)
+     continue
+    status=500 if self.reject else 200
+    payload=b'\x12\x04busy' if self.reject else (b'\x0a\x02\x08'+bytes([self.state]) if code==15 else b'')
+    if not self.reject:
+     if code==4:
+      if not self.ignore_capture:self.state=30 if self.mode==15 else 1
+      if self.drop_start:continue
+     if code==5 and not self.ignore_stop:self.state=0
+     if code==65:self.sensor=fields(packet[12:])[1]
+     if code==7 and not self.ignore_mode:self.mode=fields(fields(packet[12:])[2])[41]
+     if code==66:payload=b'\x08'+varint(self.sensor)
+     if code==8:
+      value=varint(40<<3)+varint(100)+varint(41<<3)+varint(self.mode)
+      payload=b'\x12'+varint(len(value))+value
+    response=b'\x04\x00\x00'+struct.pack('<H',status)+packet[5:12]+payload
+    self.send(response)
+    if code==1 and not self.reject:
+     # Tiny TCP fragments exercise both packet and H264 reassembly.
+     for p in range(0,len(self.video),257):
+      self.send(b'\x01\x00\x00\x20'+b'\x00'*8+self.video[p:p+257])
  def send(self,payload):
   data=struct.pack('<I',len(payload)+4)+payload
   self.client.sendall(data[:2]);self.client.sendall(data[2:11]);self.client.sendall(data[11:])
  def close(self):
+  self.closed=True
   self.listener.close();self.http.shutdown();self.http.server_close()
   if hasattr(self,'client'):self.client.close()
 
@@ -81,6 +94,7 @@ class Tests(unittest.TestCase):
   self.stub=CameraStub();self.events=[]
   self.camera=LiveCamera(lambda event,**kw:self.events.append((event,kw)),lambda *a,**kw:None,
    host='127.0.0.1',tcp_port=self.stub.port,http_port=self.stub.http.server_port)
+  self.camera.command_timeout=.4;self.camera.capture_timeout=.3
  def tearDown(self):self.camera.close();self.stub.close()
  def test_preview_and_recording(self):
   self.camera.sync_status();self.assertEqual(self.camera.recording,'idle')
@@ -94,7 +108,8 @@ class Tests(unittest.TestCase):
   self.camera.start_recording();self.assertEqual(self.camera.recording,'recording')
   self.camera.stop_preview();self.assertEqual(self.stub.state,1)
   self.camera.stop_recording();self.assertEqual(self.camera.recording,'idle')
-  self.assertEqual(self.stub.http_commands,['camera.startCapture','camera.stopCapture'])
+  self.assertEqual(self.stub.http_commands,[])
+  self.assertEqual(self.stub.codes.count(4),1);self.assertEqual(self.stub.codes.count(5),1)
  def test_reject_and_existing_capture(self):
   self.stub.state=1
   with self.assertRaises(RuntimeError):self.camera.start_recording()
@@ -106,13 +121,15 @@ class Tests(unittest.TestCase):
  def test_lost_record_ack_not_retried(self):
   self.stub.drop_start=True
   with self.assertRaises(Exception):self.camera.start_recording()
-  self.assertEqual(self.stub.http_commands.count('camera.startCapture'),1)
-  self.assertEqual(self.camera.recording,'unknown')
+  self.assertEqual(self.stub.codes.count(4),1)
+  self.assertEqual(self.camera.recording,'recording')
+  self.assertFalse(self.stub.http_commands)
  def test_mode_readback_and_record_preserves_submode(self):
   self.camera.set_mode('instaframe')
   self.assertEqual((self.stub.sensor,self.stub.mode),(3,15))
   self.camera.start_recording()
   self.assertEqual(self.stub.mode,15)
+  self.assertEqual(self.camera.recording,'recording')
   self.assertNotIn('camera.setOptions',self.stub.http_commands)
   with self.assertRaises(RuntimeError):self.camera.set_mode('front')
   self.assertEqual(self.stub.sensor,3)
@@ -159,8 +176,34 @@ class Tests(unittest.TestCase):
    self.assertNotIn(7,replacement.codes)
    self.assertTrue(any(e=='connection_health' and v['state']=='online' for e,v in self.events))
   finally:self.camera.close();replacement.close()
+ def test_start_ack_without_recording_does_not_claim_success(self):
+  self.stub.ignore_capture=True
+  with self.assertRaisesRegex(RuntimeError,'未确认开始录像'):self.camera.start_recording()
+  self.assertEqual(self.camera.recording,'idle')
+  self.assertFalse(any(e=='control_message' for e,v in self.events))
+  self.camera.set_mode('rear')
+  self.assertEqual(self.camera.sensor,2)
+ def test_stop_ack_without_stopping_keeps_recording(self):
+  self.stub.state=1;self.stub.ignore_stop=True
+  with self.assertRaisesRegex(RuntimeError,'未确认停止录像'):self.camera.stop_recording()
+  self.assertEqual(self.camera.recording,'recording')
+  self.assertFalse(any(e=='control_message' for e,v in self.events))
+ def test_control_timeout_with_stream_traffic_recovers(self):
+  self.camera.connect_session();self.camera.start_preview()
+  self.stub.stall=True
+  with self.assertRaises(TimeoutError):self.camera.sync_status()
+  self.assertIsNone(self.camera.socket)
+  self.assertEqual(self.camera.recording,'unknown')
+  self.stub.stall=False;self.camera.last_retry=0;self.camera.tick()
+  self.assertEqual(self.camera.recording,'idle')
+  self.camera.set_mode('front')
+  self.assertEqual(self.camera.sensor,1)
+  self.assertNotIn(4,self.stub.codes);self.assertNotIn(5,self.stub.codes)
  def test_unknown_protobuf(self):
   with self.assertRaises(ValueError):fields(b'\x0a\xff')
   with self.assertRaises(ValueError):fields(b'\x0a\x03a')
+ def test_unknown_capture_state_does_not_hide_stop(self):
+  self.camera.status_payload(b'\x08\x63')
+  self.assertEqual(self.camera.recording,'unknown')
 
 if __name__=='__main__':unittest.main(verbosity=2)
